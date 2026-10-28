@@ -93,4 +93,30 @@ mod tests {
         assert!(b.is_empty());
         assert!(b.capacity() >= 4096);
     }
+
+    #[test]
+    fn release_drops_non_power_of_two_capacity() {
+        let pool = LoopBufPool::new(8);
+        pool.release(LoopBuf::with_capacity(5000)); // not a power of two
+        // Nothing was stored, so acquiring the same size class allocates fresh.
+        let buckets = pool.buckets.lock().unwrap();
+        assert!(buckets.iter().all(|b| b.is_empty()));
+    }
+
+    #[test]
+    fn release_drops_oversized_capacity() {
+        let pool = LoopBufPool::new(8);
+        pool.release(LoopBuf::with_capacity(MAX_BUCKET * 2));
+        let buckets = pool.buckets.lock().unwrap();
+        assert!(buckets.iter().all(|b| b.is_empty()));
+    }
+
+    #[test]
+    fn release_drops_once_bucket_is_full() {
+        let pool = LoopBufPool::new(1);
+        pool.release(LoopBuf::with_capacity(MIN_BUCKET));
+        pool.release(LoopBuf::with_capacity(MIN_BUCKET));
+        let buckets = pool.buckets.lock().unwrap();
+        assert_eq!(buckets[bucket_index(MIN_BUCKET)].len(), 1);
+    }
 }

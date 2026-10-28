@@ -101,6 +101,7 @@ impl LoopBuf {
         // SAFETY: see the `data` field doc -- `u8` has no validity
         // invariant, so treating the spare capacity as initialized is
         // sound; nothing reads past `len` bytes from `read`.
+        #[allow(clippy::uninit_vec)]
         unsafe {
             data.set_len(data.capacity());
         }
@@ -285,6 +286,21 @@ mod tests {
         ring.clear();
         assert!(ring.is_empty());
         assert_eq!(ring.capacity(), 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "commit_write: n exceeds spare capacity")]
+    fn commit_write_past_spare_capacity_panics() {
+        let mut ring = LoopBuf::with_capacity(4);
+        ring.commit_write(5);
+    }
+
+    #[test]
+    #[should_panic(expected = "advance: n exceeds readable length")]
+    fn advance_past_readable_length_panics() {
+        let mut ring = LoopBuf::with_capacity(4);
+        ring.extend_from_slice(b"ab");
+        ring.advance(3);
     }
 
     /// A token scanned across many arbitrarily small chunks, including
