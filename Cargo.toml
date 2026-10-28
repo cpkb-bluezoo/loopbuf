@@ -1,0 +1,17 @@
+[package]
+name = "loopbuf"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "A pooled, fixed-capacity ring buffer for feeding bytes to push parsers"
+readme = "README.md"
+license = "LGPL-3.0-or-later"
+repository = "https://github.com/cpkb-bluezoo/loopbuf"
+keywords = ["buffer", "ring-buffer", "parser", "streaming", "io"]
+categories = ["data-structures", "parser-implementations"]
+
+[lib]
+name = "loopbuf"
+path = "src/lib.rs"
+
+[dev-dependencies]
