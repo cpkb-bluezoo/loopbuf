@@ -59,14 +59,49 @@
 //! - [`LoopBuf::readable_spans`] hands back unconsumed bytes for a parser to
 //!   scan, followed by [`LoopBuf::advance`] once bytes have been consumed.
 //!
+//! Because a token may straddle the wrap, [`LoopBuf::spans`] returns the same
+//! readable bytes as a [`Spans`]: one logical sequence that can be indexed,
+//! sliced and copied out of without caring where the seam is. A parser looks
+//! at a token through it, decides how much to use, and then calls
+//! [`LoopBuf::advance`].
+//!
+//! # `std::io`
+//!
+//! `LoopBuf` implements [`std::io::Write`] (append up to the spare capacity)
+//! and [`std::io::Read`] (take from the front and advance), so a ring can sit
+//! directly behind a `Writer`-style encoder or be drained with
+//! `io::copy`. Neither ever blocks or grows: a write to a full ring fails with
+//! [`io::ErrorKind::WouldBlock`] (drain it and try again), and reading an
+//! empty ring returns `Ok(0)`, meaning nothing is buffered right now rather
+//! than end of stream. `write_all` is all or nothing, so a `WouldBlock` leaves
+//! the ring untouched and the same call can simply be repeated once it has
+//! been drained.
+//!
+//! # Zero-copy windows
+//!
+//! A parser that wants to hand a *sub-range* of its input to its own
+//! consumer (an HTTP/2 frame payload, say) without copying calls
+//! [`LoopBuf::window`]. That narrows the buffer to the requested range,
+//! returning a guard that derefs to the same `LoopBuf`; dropping the guard
+//! restores the exact prior read position and length. It is the ring
+//! equivalent of Gumdrop's save `position()`/`limit()`, narrow, call the
+//! consumer, restore idiom, with no slice object and no copy. The consumer
+//! reads the window with the ordinary [`LoopBuf::readable_spans`] and
+//! [`LoopBuf::advance`]; whatever it consumes is *not* carried over, so the
+//! parser decides itself how far to advance afterwards.
+//!
 //! A parser that needs a token's bytes to outlive what the ring will retain
 //! copies out of these spans into its own scratch storage, exactly as it
 //! already would copy out of any other buffer type's slice view -- this
 //! type doesn't need to know about that case at all.
 
 mod pool;
+mod spans;
+
+use std::io;
 
 pub use pool::LoopBufPool;
+pub use spans::Spans;
 
 /// A fixed-capacity ring buffer of bytes.
 ///
@@ -89,12 +124,17 @@ pub struct LoopBuf {
     read: usize,
     /// Number of unread bytes currently buffered.
     len: usize,
+    /// Number of live [`Window`] guards. While nonzero the logical end of
+    /// the readable region is not the end of the buffered data, so writing
+    /// is disabled.
+    windows: usize,
 }
 
 impl LoopBuf {
     /// Creates a ring with exactly `capacity` bytes of room (capacity is
     /// never zero; a zero request is rounded up to 1). Fixed for life --
     /// see the module docs.
+    #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
         let capacity = capacity.max(1);
         let mut data = Vec::with_capacity(capacity);
@@ -105,29 +145,34 @@ impl LoopBuf {
         unsafe {
             data.set_len(data.capacity());
         }
-        Self { data, read: 0, len: 0 }
+        Self { data, read: 0, len: 0, windows: 0 }
     }
 
     /// Total bytes this ring can hold. Fixed for life.
+    #[inline]
     pub fn capacity(&self) -> usize {
         self.data.len()
     }
 
     /// Number of unread bytes currently buffered.
+    #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    #[inline]
     pub fn is_full(&self) -> bool {
         self.len == self.capacity()
     }
 
     /// Discards all buffered content, without touching the allocation --
     /// used when returning a buffer to a [`LoopBufPool`] for reuse.
+    #[inline]
     pub fn clear(&mut self) {
         self.read = 0;
         self.len = 0;
@@ -145,10 +190,14 @@ impl LoopBuf {
 
     /// Writable space, split at the backing array's physical end if the
     /// spare region wraps. The second slice is empty whenever it doesn't.
+    ///
+    /// Always empty while a [`Window`] is live: the window's end is not the
+    /// end of the buffered data, so writing there would clobber it.
+    #[inline]
     pub fn spare_capacity_mut(&mut self) -> (&mut [u8], &mut [u8]) {
         let cap = self.capacity();
         let spare = cap - self.len;
-        if spare == 0 {
+        if spare == 0 || self.windows > 0 {
             return (&mut [], &mut []);
         }
         let w = self.write_index();
@@ -164,8 +213,11 @@ impl LoopBuf {
     /// Marks `n` bytes, just written into the span(s) [`Self::spare_capacity_mut`]
     /// returned (first slice first), as now part of the readable content.
     ///
-    /// Panics if `n` exceeds the spare capacity at the time of the call.
+    /// Panics if `n` exceeds the spare capacity at the time of the call
+    /// (which is zero while a [`Window`] is live).
+    #[inline]
     pub fn commit_write(&mut self, n: usize) {
+        assert!(self.windows == 0 || n == 0, "commit_write: buffer is windowed");
         assert!(n <= self.capacity() - self.len, "commit_write: n exceeds spare capacity");
         self.len += n;
     }
@@ -175,6 +227,7 @@ impl LoopBuf {
     /// `data.len()` only once the ring is full; since it never grows (see
     /// the module docs), the caller decides what to do with the rest
     /// (apply backpressure, or copy it into its own accumulator).
+    #[inline]
     pub fn extend_from_slice(&mut self, data: &[u8]) -> usize {
         let (a, b) = self.spare_capacity_mut();
         let n_a = a.len().min(data.len());
@@ -189,6 +242,7 @@ impl LoopBuf {
 
     /// Unconsumed bytes, split at the backing array's physical end if the
     /// live region wraps. The second slice is empty whenever it doesn't.
+    #[inline]
     pub fn readable_spans(&self) -> (&[u8], &[u8]) {
         if self.len == 0 {
             return (&[], &[]);
@@ -203,16 +257,151 @@ impl LoopBuf {
         }
     }
 
+    /// The unconsumed bytes as one logical sequence that can be indexed and
+    /// sliced across the wrap. See [`Spans`].
+    #[inline]
+    pub fn spans(&self) -> Spans<'_> {
+        let (first, second) = self.readable_spans();
+        Spans::new(first, second)
+    }
+
     /// Marks `n` bytes, from the front of what [`Self::readable_spans`]
     /// returned, as consumed -- freeing that space for reuse via
     /// wraparound, with no data movement.
     ///
     /// Panics if `n` exceeds the currently readable length.
+    #[inline]
     pub fn advance(&mut self, n: usize) {
         assert!(n <= self.len, "advance: n exceeds readable length");
         let cap = self.capacity();
         self.read = if cap == 0 { 0 } else { (self.read + n) % cap };
         self.len -= n;
+    }
+
+    /// Narrows the readable region to `len` bytes starting `offset` bytes
+    /// past the current read position, for presenting that sub-range to a
+    /// consumer with no copy and no slice object.
+    ///
+    /// The returned [`Window`] derefs to this same `LoopBuf`, so the
+    /// consumer just takes `&mut LoopBuf` and reads it with
+    /// [`Self::readable_spans`] / [`Self::advance`] as usual (the range may
+    /// wrap the physical end, hence two spans). Dropping the guard restores
+    /// the exact read position and length from before, discarding whatever
+    /// the consumer advanced past; check [`Self::len`] on the guard first if
+    /// the parser needs to know how much was left unconsumed. While the
+    /// window is live the buffer cannot be written to. Windows nest.
+    ///
+    /// Panics if `offset + len` exceeds the currently readable length.
+    #[inline]
+    pub fn window(&mut self, offset: usize, len: usize) -> Window<'_> {
+        assert!(
+            offset.checked_add(len).is_some_and(|end| end <= self.len),
+            "window: range exceeds readable length"
+        );
+        let saved_read = self.read;
+        let saved_len = self.len;
+        let cap = self.capacity();
+        self.read = (self.read + offset) % cap;
+        self.len = len;
+        self.windows += 1;
+        Window { buf: self, saved_read, saved_len }
+    }
+}
+
+/// Appends to the ring, up to its spare capacity.
+///
+/// [`write`](io::Write::write) is a short write when the ring is nearly full,
+/// as usual. A write to a ring with no spare capacity at all returns
+/// [`io::ErrorKind::WouldBlock`]: it is full right now, not closed, so drain
+/// it and try again.
+///
+/// [`write_all`](io::Write::write_all) is **all or nothing**. If the whole
+/// buffer does not fit it writes none of it and returns `WouldBlock`, so the
+/// ring is exactly as it was and the caller can drain it and repeat the same
+/// call. (The default `write_all` would write the part that fits and then
+/// fail, leaving the caller unable to tell how much went out.) A buffer larger
+/// than the ring's whole capacity can never fit, however much is drained, so
+/// that is an [`io::ErrorKind::InvalidInput`] error instead.
+impl io::Write for LoopBuf {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        match self.extend_from_slice(buf) {
+            0 => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "LoopBuf is full: read from it and try again",
+            )),
+            n => Ok(n),
+        }
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        if buf.len() > self.capacity() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "write is larger than the LoopBuf's whole capacity",
+            ));
+        }
+        // a live window leaves no room to write: see `spare_capacity_mut`
+        let spare = if self.windows > 0 { 0 } else { self.capacity() - self.len };
+        if buf.len() > spare {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "LoopBuf has no room for the whole write: read from it and try again",
+            ));
+        }
+        self.extend_from_slice(buf);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Takes bytes from the front of the ring and advances past them, so the
+/// space is writable again.
+///
+/// `Ok(0)` on an empty ring means nothing is buffered right now, not that a
+/// stream has ended, which lets `io::copy` drain exactly what is there.
+impl io::Read for LoopBuf {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let n = self.spans().copy_to(0, out);
+        self.advance(n);
+        Ok(n)
+    }
+}
+
+/// Guard returned by [`LoopBuf::window`]. Derefs to the narrowed
+/// [`LoopBuf`]; restores the original read position and length on drop.
+pub struct Window<'a> {
+    buf: &'a mut LoopBuf,
+    saved_read: usize,
+    saved_len: usize,
+}
+
+impl std::ops::Deref for Window<'_> {
+    type Target = LoopBuf;
+    fn deref(&self) -> &LoopBuf {
+        self.buf
+    }
+}
+
+impl std::ops::DerefMut for Window<'_> {
+    fn deref_mut(&mut self) -> &mut LoopBuf {
+        self.buf
+    }
+}
+
+impl Drop for Window<'_> {
+    fn drop(&mut self) {
+        self.buf.read = self.saved_read;
+        self.buf.len = self.saved_len;
+        self.buf.windows -= 1;
     }
 }
 
@@ -326,5 +515,230 @@ mod tests {
             }
         }
         assert_eq!(consumed, input);
+    }
+
+    fn joined(ring: &LoopBuf) -> Vec<u8> {
+        let (a, b) = ring.readable_spans();
+        [a, b].concat()
+    }
+
+    #[test]
+    fn window_narrows_then_restores_exactly() {
+        let mut ring = LoopBuf::with_capacity(16);
+        ring.extend_from_slice(b"HEADERpayloadTRAILER");
+        let before = joined(&ring);
+        {
+            let mut w = ring.window(6, 7);
+            assert_eq!(joined(&w), b"payload");
+            assert_eq!(w.len(), 7);
+            w.advance(3); // consumer eats part of it
+            assert_eq!(joined(&w), b"load");
+        }
+        assert_eq!(joined(&ring), before, "consumer progress must not leak out");
+    }
+
+    #[test]
+    fn window_across_the_physical_end_is_two_spans() {
+        let mut ring = LoopBuf::with_capacity(8);
+        ring.extend_from_slice(b"abcdefgh");
+        ring.advance(6);
+        ring.extend_from_slice(b"ABCDEF"); // "gh" + "ABCDEF" wraps
+        let before = joined(&ring);
+        {
+            let w = ring.window(1, 4);
+            let (a, b) = w.readable_spans();
+            assert_eq!(a, b"h");
+            assert_eq!(b, b"ABC");
+        }
+        assert_eq!(joined(&ring), before);
+    }
+
+    #[test]
+    fn window_blocks_writes_and_unblocks_after() {
+        let mut ring = LoopBuf::with_capacity(8);
+        ring.extend_from_slice(b"abcd");
+        {
+            let mut w = ring.window(0, 2);
+            let (a, b) = w.spare_capacity_mut();
+            assert!(a.is_empty() && b.is_empty());
+            assert_eq!(w.extend_from_slice(b"zz"), 0);
+        }
+        assert_eq!(ring.extend_from_slice(b"ef"), 2);
+        assert_eq!(joined(&ring), b"abcdef");
+    }
+
+    #[test]
+    fn windows_nest() {
+        let mut ring = LoopBuf::with_capacity(16);
+        ring.extend_from_slice(b"0123456789");
+        {
+            let mut outer = ring.window(2, 6);
+            {
+                let inner = outer.window(1, 3);
+                assert_eq!(joined(&inner), b"345");
+            }
+            assert_eq!(joined(&outer), b"234567");
+        }
+        assert_eq!(joined(&ring), b"0123456789");
+    }
+
+    #[test]
+    fn window_restores_on_panic() {
+        let mut ring = LoopBuf::with_capacity(8);
+        ring.extend_from_slice(b"abcd");
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut w = ring.window(1, 2);
+            w.advance(2);
+            panic!("consumer blew up");
+        }));
+        assert!(r.is_err());
+        assert_eq!(joined(&ring), b"abcd");
+        assert_eq!(ring.extend_from_slice(b"ef"), 2, "writes re-enabled");
+    }
+
+    #[test]
+    #[should_panic(expected = "window: range exceeds readable length")]
+    fn window_past_readable_length_panics() {
+        let mut ring = LoopBuf::with_capacity(8);
+        ring.extend_from_slice(b"abc");
+        let _ = ring.window(2, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "advance: n exceeds readable length")]
+    fn consumer_cannot_advance_past_window() {
+        let mut ring = LoopBuf::with_capacity(8);
+        ring.extend_from_slice(b"abcdef");
+        let mut w = ring.window(0, 2);
+        w.advance(3);
+    }
+
+    #[test]
+    fn spans_indexes_a_wrapped_ring_as_one_sequence() {
+        let mut ring = LoopBuf::with_capacity(8);
+        ring.extend_from_slice(b"abcdefgh");
+        ring.advance(6);
+        ring.extend_from_slice(b"ABCDEF"); // "gh" + "ABCDEF" wraps
+        let spans = ring.spans();
+        assert_eq!(spans.len(), 8);
+        assert_eq!(spans.as_slices(), (&b"gh"[..], &b"ABCDEF"[..]));
+        assert_eq!(spans.to_vec(), b"ghABCDEF");
+        assert_eq!(spans[1], b'h');
+        assert_eq!(spans[2], b'A');
+        assert_eq!(spans.contiguous(1..3), None);
+        assert_eq!(spans.contiguous(2..8), Some(&b"ABCDEF"[..]));
+    }
+
+    #[test]
+    fn spans_of_a_window_cover_only_the_window() {
+        let mut ring = LoopBuf::with_capacity(8);
+        ring.extend_from_slice(b"abcdefgh");
+        ring.advance(6);
+        ring.extend_from_slice(b"ABCDEF");
+        let w = ring.window(1, 4);
+        assert_eq!(w.spans().to_vec(), b"hABC");
+    }
+
+    #[test]
+    fn write_appends_and_reports_a_short_write_when_nearly_full() {
+        use std::io::Write;
+        let mut ring = LoopBuf::with_capacity(8);
+        assert_eq!(ring.write(b"hello").unwrap(), 5);
+        assert_eq!(ring.write(b"world").unwrap(), 3, "only 3 bytes of room");
+        assert!(ring.is_full());
+        assert_eq!(ring.spans().to_vec(), b"hellowor");
+        assert_eq!(ring.write(b"").unwrap(), 0);
+        ring.flush().unwrap();
+    }
+
+    #[test]
+    fn writing_to_a_full_ring_would_block_rather_than_claim_it_is_closed() {
+        use std::io::Write;
+        let mut ring = LoopBuf::with_capacity(4);
+        ring.write_all(b"abcd").unwrap();
+        let err = ring.write(b"e").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        ring.advance(2);
+        assert_eq!(ring.write(b"ef").unwrap(), 2, "draining makes room again");
+        let err = ring.write_all(b"xyz").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn read_drains_across_the_wrap_and_frees_the_space() {
+        use std::io::Read;
+        let mut ring = LoopBuf::with_capacity(8);
+        ring.extend_from_slice(b"abcdefgh");
+        ring.advance(6);
+        ring.extend_from_slice(b"ABCDEF"); // wraps
+        let mut out = [0u8; 5];
+        assert_eq!(ring.read(&mut out).unwrap(), 5);
+        assert_eq!(&out, b"ghABC");
+        assert_eq!(ring.len(), 3);
+        let mut rest = Vec::new();
+        assert_eq!(ring.read_to_end(&mut rest).unwrap(), 3);
+        assert_eq!(rest, b"DEF");
+        assert!(ring.is_empty());
+        assert_eq!(ring.read(&mut out).unwrap(), 0, "empty: nothing buffered");
+    }
+
+    #[test]
+    fn io_copy_moves_a_ring_into_a_writer_and_back() {
+        use std::io::Write;
+        let mut ring = LoopBuf::with_capacity(16);
+        ring.write_all(b"through the ring").unwrap();
+        let mut sink = Vec::new();
+        assert_eq!(io::copy(&mut ring, &mut sink).unwrap(), 16);
+        assert_eq!(sink, b"through the ring");
+        assert!(ring.is_empty());
+    }
+
+    #[test]
+    fn write_all_is_all_or_nothing() {
+        use std::io::Write;
+        let mut ring = LoopBuf::with_capacity(8);
+        ring.write_all(b"abcdef").unwrap();
+        // only 2 bytes of room: nothing at all may be written, so that the
+        // caller can drain the ring and retry the same call
+        let err = ring.write_all(b"ghijk").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(ring.spans().to_vec(), b"abcdef", "the ring is untouched");
+
+        ring.advance(3);
+        ring.write_all(b"ghijk").unwrap();
+        assert_eq!(ring.spans().to_vec(), b"defghijk");
+    }
+
+    #[test]
+    fn write_all_larger_than_the_whole_ring_can_never_succeed() {
+        use std::io::Write;
+        let mut ring = LoopBuf::with_capacity(4);
+        ring.write_all(b"ab").unwrap();
+        // WouldBlock would invite a retry that can never work
+        let err = ring.write_all(b"cdefg").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(ring.spans().to_vec(), b"ab");
+    }
+
+    #[test]
+    fn write_all_of_nothing_succeeds_even_when_full() {
+        use std::io::Write;
+        let mut ring = LoopBuf::with_capacity(2);
+        ring.write_all(b"ab").unwrap();
+        ring.write_all(b"").unwrap();
+        assert_eq!(ring.len(), 2);
+    }
+
+    #[test]
+    fn write_all_to_a_windowed_ring_would_block_and_writes_nothing() {
+        use std::io::Write;
+        let mut ring = LoopBuf::with_capacity(8);
+        ring.write_all(b"abcd").unwrap();
+        {
+            let mut w = ring.window(0, 2);
+            let err = w.write_all(b"x").unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        }
+        assert_eq!(ring.spans().to_vec(), b"abcd");
     }
 }

@@ -30,6 +30,55 @@ assert_eq!(readable, b"hello");
 ring.advance(readable.len());
 ```
 
+## Zero-copy windows
+
+To present a sub-range of the buffer to a downstream consumer (e.g. an
+HTTP/2 frame payload) without copying, narrow the buffer with `window`.
+The guard derefs to the same `LoopBuf` and restores the previous read
+position and length when dropped -- no slice object, no copy:
+
+```rust
+let mut ring = LoopBuf::with_capacity(4096);
+ring.extend_from_slice(b"HDRpayload");
+ring.advance(3);
+
+{
+    let mut w = ring.window(0, 7);      // consumer sees only "payload"
+    let (a, b) = w.readable_spans();    // `b` is non-empty if it wraps
+    assert_eq!([a, b].concat(), b"payload");
+    w.advance(7);                       // consumer's progress is local...
+}
+assert_eq!(ring.len(), 7);              // ...the parser advances itself
+```
+
+While a window is live the buffer is read-only (`spare_capacity_mut`
+is empty). Windows nest.
+
+## One logical sequence: `Spans`
+
+A token may straddle the ring's wrap, so the readable region is up to two
+slices. `spans()` borrows it as a `Spans`, which indexes, slices and copies
+across the join without moving anything:
+
+```rust
+let spans = ring.spans();
+let first = spans[0];                         // index like a slice
+let run = spans.span_from(0);                 // scan the contiguous part fast
+let word = spans.contiguous(4..8);            // None only if it straddles
+let mut tag = [0u8; 4];
+spans.copy_to(10, &mut tag);                  // a fixed-size value, wherever it sits
+let rest = spans.skip(8);                     // a view without the first 8 bytes
+```
+
+## `std::io`
+
+`LoopBuf` implements `io::Write` (append up to the spare capacity) and
+`io::Read` (take from the front and advance), so an encoder can write straight
+into the ring a parser reads, and a ring can be drained with `io::copy`.
+Neither blocks or grows: writing to a full ring is `ErrorKind::WouldBlock`
+(drain it and retry), and reading an empty one is `Ok(0)`, meaning nothing is
+buffered right now rather than end of stream.
+
 ## Design
 
 - **Fixed capacity, for life.** The ring never grows. A token bigger than
