@@ -79,6 +79,32 @@ Neither blocks or grows: writing to a full ring is `ErrorKind::WouldBlock`
 (drain it and retry), and reading an empty one is `Ok(0)`, meaning nothing is
 buffered right now rather than end of stream.
 
+## Writing a whole token or none of it
+
+An encoder writing into a ring that a consumer drains has to make each token
+atomic: it either all goes in or none of it does, so the caller can drain and
+repeat the same call. The pieces for that:
+
+- `spare_len()` is the room to write right now (zero while a window is live).
+- `write_all` (the `io::Write` impl) is all or nothing, and `WouldBlock` leaves
+  the ring untouched.
+- `truncate(len)` takes back everything written since the length was `len`, to
+  undo a sequence of writes that turned out not to fit as a whole.
+- `overwrite(offset, bytes)` fills in bytes already written, in place, to
+  back-patch what could not be known at the time: a length prefix, a frame
+  header.
+
+```rust
+let start = ring.len();
+ring.extend_from_slice(&[tag, 0, 0, 0, 0]);       // a length, to fill in later
+if write_content(&mut ring).is_err() {
+    ring.truncate(start);                         // as if it never happened
+} else {
+    let length = (ring.len() - start - 5) as u32;
+    ring.overwrite(start + 1, &length.to_le_bytes());
+}
+```
+
 ## Design
 
 - **Fixed capacity, for life.** The ring never grows. A token bigger than

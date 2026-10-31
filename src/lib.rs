@@ -178,13 +178,26 @@ impl LoopBuf {
         self.len = 0;
     }
 
+    /// `index` wrapped into the backing array. Every index passed is below
+    /// twice the capacity (a position plus an amount that is at most the
+    /// capacity), so a subtraction does what `%` would, without the division.
+    #[inline]
+    fn wrap(&self, index: usize) -> usize {
+        let cap = self.capacity();
+        if index >= cap {
+            index - cap
+        } else {
+            index
+        }
+    }
+
     /// Index the next written byte would land at.
     fn write_index(&self) -> usize {
         let cap = self.capacity();
         if cap == 0 {
             0
         } else {
-            (self.read + self.len) % cap
+            self.wrap(self.read + self.len)
         }
     }
 
@@ -222,6 +235,50 @@ impl LoopBuf {
         self.len += n;
     }
 
+    /// Room to write right now: the spare capacity, or zero while a [`Window`]
+    /// is live. This is what `spare_capacity_mut` would hand back in total.
+    #[inline]
+    pub fn spare_len(&self) -> usize {
+        if self.windows > 0 {
+            0
+        } else {
+            self.capacity() - self.len
+        }
+    }
+
+    /// Discards the most recent writes, keeping only the first `len` readable
+    /// bytes. The undo for a sequence of writes that turned out not to fit as
+    /// a whole: note [`Self::len`] before starting, and truncate back to it.
+    ///
+    /// Panics if `len` is more than the readable length, or while a
+    /// [`Window`] is live (the window's saved state would no longer match).
+    pub fn truncate(&mut self, len: usize) {
+        assert!(self.windows == 0, "truncate: buffer is windowed");
+        assert!(len <= self.len, "truncate: len exceeds readable length");
+        self.len = len;
+    }
+
+    /// Overwrites already-written bytes in place, starting `offset` bytes past
+    /// the read position, without changing the length. For filling in what
+    /// could not be known when it was written: a length prefix, a frame
+    /// header. The bytes must not have been consumed in the meantime.
+    ///
+    /// Panics if the range runs past the readable bytes.
+    pub fn overwrite(&mut self, offset: usize, data: &[u8]) {
+        assert!(
+            offset.checked_add(data.len()).is_some_and(|end| end <= self.len),
+            "overwrite: range exceeds readable length"
+        );
+        if data.is_empty() {
+            return;
+        }
+        let cap = self.capacity();
+        let start = self.wrap(self.read + offset);
+        let head = data.len().min(cap - start);
+        self.data[start..start + head].copy_from_slice(&data[..head]);
+        self.data[..data.len() - head].copy_from_slice(&data[head..]);
+    }
+
     /// Copies as much of `data` as currently fits into spare capacity.
     /// Returns how many bytes were actually copied -- fewer than
     /// `data.len()` only once the ring is full; since it never grows (see
@@ -229,15 +286,19 @@ impl LoopBuf {
     /// (apply backpressure, or copy it into its own accumulator).
     #[inline]
     pub fn extend_from_slice(&mut self, data: &[u8]) -> usize {
-        let (a, b) = self.spare_capacity_mut();
-        let n_a = a.len().min(data.len());
-        a[..n_a].copy_from_slice(&data[..n_a]);
-        let remaining = &data[n_a..];
-        let n_b = b.len().min(remaining.len());
-        b[..n_b].copy_from_slice(&remaining[..n_b]);
-        let total = n_a + n_b;
-        self.commit_write(total);
-        total
+        let n = data.len().min(self.spare_len());
+        if n == 0 {
+            return 0;
+        }
+        let start = self.write_index();
+        let first = n.min(self.capacity() - start);
+        self.data[start..start + first].copy_from_slice(&data[..first]);
+        if first < n {
+            // wrapped past the physical end
+            self.data[..n - first].copy_from_slice(&data[first..n]);
+        }
+        self.len += n;
+        n
     }
 
     /// Unconsumed bytes, split at the backing array's physical end if the
@@ -273,8 +334,7 @@ impl LoopBuf {
     #[inline]
     pub fn advance(&mut self, n: usize) {
         assert!(n <= self.len, "advance: n exceeds readable length");
-        let cap = self.capacity();
-        self.read = if cap == 0 { 0 } else { (self.read + n) % cap };
+        self.read = self.wrap(self.read + n);
         self.len -= n;
     }
 
@@ -300,8 +360,7 @@ impl LoopBuf {
         );
         let saved_read = self.read;
         let saved_len = self.len;
-        let cap = self.capacity();
-        self.read = (self.read + offset) % cap;
+        self.read = self.wrap(self.read + offset);
         self.len = len;
         self.windows += 1;
         Window { buf: self, saved_read, saved_len }
@@ -740,5 +799,84 @@ mod tests {
             assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
         }
         assert_eq!(ring.spans().to_vec(), b"abcd");
+    }
+
+    #[test]
+    fn spare_len_is_the_room_to_write_right_now() {
+        let mut ring = LoopBuf::with_capacity(8);
+        assert_eq!(ring.spare_len(), 8);
+        ring.extend_from_slice(b"abcde");
+        assert_eq!(ring.spare_len(), 3);
+        {
+            let w = ring.window(0, 2);
+            assert_eq!(w.spare_len(), 0, "a window leaves no room to write");
+        }
+        assert_eq!(ring.spare_len(), 3);
+    }
+
+    #[test]
+    fn truncate_undoes_the_most_recent_writes_even_across_the_wrap() {
+        let mut ring = LoopBuf::with_capacity(8);
+        ring.extend_from_slice(b"abcdefgh");
+        ring.advance(6);
+        ring.extend_from_slice(b"ABCDEF"); // "gh" + "ABCDEF" wraps
+        ring.truncate(4);
+        assert_eq!(ring.spans().to_vec(), b"ghAB");
+        assert_eq!(ring.spare_len(), 4);
+        ring.extend_from_slice(b"xy");
+        assert_eq!(ring.spans().to_vec(), b"ghABxy");
+        ring.truncate(0);
+        assert!(ring.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "truncate: len exceeds readable length")]
+    fn truncate_cannot_grow() {
+        let mut ring = LoopBuf::with_capacity(8);
+        ring.extend_from_slice(b"ab");
+        ring.truncate(3);
+    }
+
+    #[test]
+    #[should_panic(expected = "truncate: buffer is windowed")]
+    fn truncate_is_refused_while_windowed() {
+        let mut ring = LoopBuf::with_capacity(8);
+        ring.extend_from_slice(b"abcd");
+        let mut w = ring.window(0, 2);
+        w.truncate(1);
+    }
+
+    #[test]
+    fn overwrite_patches_bytes_already_written_even_across_the_wrap() {
+        let mut ring = LoopBuf::with_capacity(8);
+        ring.extend_from_slice(b"abcdefgh");
+        ring.advance(6);
+        ring.extend_from_slice(b"ABCDEF"); // "gh" + "ABCDEF": the seam is after "gh"
+        ring.overwrite(1, b"123"); // straddles the seam
+        assert_eq!(ring.spans().to_vec(), b"g123CDEF");
+        ring.overwrite(0, b"X");
+        ring.overwrite(7, b"Y");
+        assert_eq!(ring.spans().to_vec(), b"X123CDEY");
+        ring.overwrite(3, b""); // nothing to do
+        assert_eq!(ring.len(), 8, "overwriting never changes the length");
+    }
+
+    #[test]
+    fn overwrite_is_relative_to_a_window() {
+        let mut ring = LoopBuf::with_capacity(8);
+        ring.extend_from_slice(b"abcdef");
+        {
+            let mut w = ring.window(2, 3);
+            w.overwrite(1, b"Z");
+        }
+        assert_eq!(ring.spans().to_vec(), b"abcZef");
+    }
+
+    #[test]
+    #[should_panic(expected = "overwrite: range exceeds readable length")]
+    fn overwrite_cannot_reach_past_what_is_written() {
+        let mut ring = LoopBuf::with_capacity(8);
+        ring.extend_from_slice(b"abc");
+        ring.overwrite(2, b"xy");
     }
 }
