@@ -93,6 +93,11 @@ repeat the same call. The pieces for that:
 - `overwrite(offset, bytes)` fills in bytes already written, in place, to
   back-patch what could not be known at the time: a length prefix, a frame
   header.
+- `copy_within(src, dest)` moves bytes already written to another offset, like
+  `slice::copy_within` (ranges may overlap, and may wrap). It opens a gap in
+  what has been written when a length prefix turns out to need more room than
+  was reserved for it: extend the ring by the difference, move the content on,
+  then `overwrite` the prefix.
 
 ```rust
 let start = ring.len();
