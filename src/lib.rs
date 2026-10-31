@@ -147,7 +147,12 @@ impl LoopBuf {
         unsafe {
             data.set_len(data.capacity());
         }
-        Self { data, read: 0, len: 0, windows: 0 }
+        Self {
+            data,
+            read: 0,
+            len: 0,
+            windows: 0,
+        }
     }
 
     /// Total bytes this ring can hold. Fixed for life.
@@ -232,8 +237,14 @@ impl LoopBuf {
     /// (which is zero while a [`Window`] is live).
     #[inline]
     pub fn commit_write(&mut self, n: usize) {
-        assert!(self.windows == 0 || n == 0, "commit_write: buffer is windowed");
-        assert!(n <= self.capacity() - self.len, "commit_write: n exceeds spare capacity");
+        assert!(
+            self.windows == 0 || n == 0,
+            "commit_write: buffer is windowed"
+        );
+        assert!(
+            n <= self.capacity() - self.len,
+            "commit_write: n exceeds spare capacity"
+        );
         self.len += n;
     }
 
@@ -268,7 +279,9 @@ impl LoopBuf {
     /// Panics if the range runs past the readable bytes.
     pub fn overwrite(&mut self, offset: usize, data: &[u8]) {
         assert!(
-            offset.checked_add(data.len()).is_some_and(|end| end <= self.len),
+            offset
+                .checked_add(data.len())
+                .is_some_and(|end| end <= self.len),
             "overwrite: range exceeds readable length"
         );
         if data.is_empty() {
@@ -365,7 +378,11 @@ impl LoopBuf {
         self.read = self.wrap(self.read + offset);
         self.len = len;
         self.windows += 1;
-        Window { buf: self, saved_read, saved_len }
+        Window {
+            buf: self,
+            saved_read,
+            saved_len,
+        }
     }
 }
 
@@ -408,7 +425,11 @@ impl io::Write for LoopBuf {
             ));
         }
         // a live window leaves no room to write: see `spare_capacity_mut`
-        let spare = if self.windows > 0 { 0 } else { self.capacity() - self.len };
+        let spare = if self.windows > 0 {
+            0
+        } else {
+            self.capacity() - self.len
+        };
         if buf.len() > spare {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -487,7 +508,7 @@ mod tests {
         assert_eq!(ring.extend_from_slice(b"abcdefgh"), 8);
         assert!(ring.is_full());
         ring.advance(4); // consume "abcd"
-        // Spare capacity must be reusable even though it's not at index 0.
+                         // Spare capacity must be reusable even though it's not at index 0.
         assert_eq!(ring.extend_from_slice(b"ijkl"), 4);
         assert_eq!(ring.capacity(), 8, "must never grow");
         let (a, b) = ring.readable_spans();
@@ -503,7 +524,10 @@ mod tests {
         ring.advance(5); // fully drained, but read now sits at index 5, not 0
         let (a, b) = ring.spare_capacity_mut();
         assert_eq!(a.len() + b.len(), 8);
-        assert!(!b.is_empty(), "spare capacity should wrap across the physical end here");
+        assert!(
+            !b.is_empty(),
+            "spare capacity should wrap across the physical end here"
+        );
         assert_eq!(ring.extend_from_slice(b"abcdefgh"), 8);
         let (ra, rb) = ring.readable_spans();
         let mut joined = ra.to_vec();
@@ -566,7 +590,8 @@ mod tests {
         let mut consumed = Vec::new();
         while consumed.len() < input.len() {
             if produced < input.len() {
-                produced += ring.extend_from_slice(&input[produced..(produced + 1).min(input.len())]);
+                produced +=
+                    ring.extend_from_slice(&input[produced..(produced + 1).min(input.len())]);
             }
             if !ring.is_empty() {
                 let (a, _b) = ring.readable_spans();

@@ -98,7 +98,7 @@ mod tests {
     fn release_drops_non_power_of_two_capacity() {
         let pool = LoopBufPool::new(8);
         pool.release(LoopBuf::with_capacity(5000)); // not a power of two
-        // Nothing was stored, so acquiring the same size class allocates fresh.
+                                                    // Nothing was stored, so acquiring the same size class allocates fresh.
         let buckets = pool.buckets.lock().unwrap();
         assert!(buckets.iter().all(|b| b.is_empty()));
     }
