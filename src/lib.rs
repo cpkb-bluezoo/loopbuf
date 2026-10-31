@@ -95,12 +95,13 @@
 //! already would copy out of any other buffer type's slice view -- this
 //! type doesn't need to know about that case at all.
 
+mod error;
 mod pool;
 mod spans;
 
 use std::io;
-use std::ops::Range;
 
+pub use error::{WriteError, WriteResult};
 pub use pool::LoopBufPool;
 pub use spans::Spans;
 
@@ -278,55 +279,6 @@ impl LoopBuf {
         let head = data.len().min(cap - start);
         self.data[start..start + head].copy_from_slice(&data[..head]);
         self.data[..data.len() - head].copy_from_slice(&data[head..]);
-    }
-
-    /// Copies the readable bytes in `src` to start at readable offset `dest`,
-    /// like [`slice::copy_within`]: the ranges may overlap, and may wrap the end
-    /// of the backing array. Offsets count from the read position; the length
-    /// does not change.
-    ///
-    /// This is how to open a gap in what has been written (copy the tail
-    /// further on) or close one, without leaving the ring.
-    ///
-    /// # Panics
-    ///
-    /// If `src` or the range it is copied to is not within the readable bytes.
-    pub fn copy_within(&mut self, src: Range<usize>, dest: usize) {
-        assert!(
-            src.start <= src.end && src.end <= self.len,
-            "copy_within: source range exceeds readable length"
-        );
-        let n = src.end - src.start;
-        assert!(
-            dest.checked_add(n).is_some_and(|end| end <= self.len),
-            "copy_within: destination range exceeds readable length"
-        );
-        if n == 0 || dest == src.start {
-            return;
-        }
-        let cap = self.capacity();
-        if dest < src.start {
-            // Front to back, a run at a time, each within one stretch of the
-            // backing array on both sides.
-            let mut done = 0;
-            while done < n {
-                let from = self.wrap(self.read + src.start + done);
-                let to = self.wrap(self.read + dest + done);
-                let run = (n - done).min(cap - from).min(cap - to);
-                self.data.copy_within(from..from + run, to);
-                done += run;
-            }
-        } else {
-            // Back to front, so nothing is overwritten before it is copied.
-            let mut left = n;
-            while left > 0 {
-                let from_last = self.wrap(self.read + src.start + left - 1);
-                let to_last = self.wrap(self.read + dest + left - 1);
-                let run = left.min(from_last + 1).min(to_last + 1);
-                self.data.copy_within(from_last + 1 - run..from_last + 1, to_last + 1 - run);
-                left -= run;
-            }
-        }
     }
 
     /// Copies as much of `data` as currently fits into spare capacity.
@@ -517,93 +469,6 @@ impl Drop for Window<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The readable bytes, joined.
-    fn contents(ring: &LoopBuf) -> Vec<u8> {
-        ring.spans().to_vec()
-    }
-
-    #[test]
-    fn copy_within_moves_a_tail_forward_to_open_a_gap() {
-        let mut ring = LoopBuf::with_capacity(16);
-        ring.extend_from_slice(b"ab[content]");
-        ring.extend_from_slice(&[0, 0]);
-        ring.copy_within(2..11, 4);
-        ring.overwrite(2, b"__");
-        assert_eq!(contents(&ring), b"ab__[content]");
-    }
-
-    #[test]
-    fn copy_within_moves_a_tail_back_to_close_a_gap() {
-        let mut ring = LoopBuf::with_capacity(16);
-        ring.extend_from_slice(b"ab____[content]");
-        ring.copy_within(6..15, 2);
-        ring.truncate(11);
-        assert_eq!(contents(&ring), b"ab[content]");
-    }
-
-    #[test]
-    fn copy_within_an_empty_range_or_onto_itself_changes_nothing() {
-        let mut ring = LoopBuf::with_capacity(8);
-        ring.extend_from_slice(b"abcdef");
-        ring.copy_within(3..3, 5);
-        ring.copy_within(1..4, 1);
-        assert_eq!(contents(&ring), b"abcdef");
-    }
-
-    #[test]
-    fn copy_within_agrees_with_a_slice_wherever_the_ring_wraps() {
-        // Every read position, so every way the two ranges can straddle the
-        // end of the backing array, and every overlap of source and
-        // destination.
-        for cap in [5usize, 8, 13] {
-            for read in 0..cap {
-                for len in 0..=cap {
-                    let mut ring = LoopBuf::with_capacity(cap);
-                    // Move the read position to `read` by writing and reading.
-                    ring.extend_from_slice(&vec![0; read]);
-                    ring.advance(read);
-                    let bytes: Vec<u8> = (0..len as u8).map(|b| b + 1).collect();
-                    ring.extend_from_slice(&bytes);
-                    for src_start in 0..=len {
-                        for src_end in src_start..=len {
-                            let n = src_end - src_start;
-                            for dest in 0..=(len - n) {
-                                let mut model = bytes.clone();
-                                model.copy_within(src_start..src_end, dest);
-                                let mut copy = LoopBuf::with_capacity(cap);
-                                copy.extend_from_slice(&vec![0; read]);
-                                copy.advance(read);
-                                copy.extend_from_slice(&bytes);
-                                copy.copy_within(src_start..src_end, dest);
-                                assert_eq!(
-                                    contents(&copy),
-                                    model,
-                                    "cap {cap} read {read} len {len} src {src_start}..{src_end} dest {dest}"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "copy_within: source range exceeds readable length")]
-    fn copy_within_refuses_a_source_past_the_end() {
-        let mut ring = LoopBuf::with_capacity(8);
-        ring.extend_from_slice(b"abc");
-        ring.copy_within(1..4, 0);
-    }
-
-    #[test]
-    #[should_panic(expected = "copy_within: destination range exceeds readable length")]
-    fn copy_within_refuses_a_destination_past_the_end() {
-        let mut ring = LoopBuf::with_capacity(8);
-        ring.extend_from_slice(b"abc");
-        ring.copy_within(0..2, 2);
-    }
 
     #[test]
     fn write_then_read_round_trips() {

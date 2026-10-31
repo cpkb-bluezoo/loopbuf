@@ -88,16 +88,15 @@ repeat the same call. The pieces for that:
 - `spare_len()` is the room to write right now (zero while a window is live).
 - `write_all` (the `io::Write` impl) is all or nothing, and `WouldBlock` leaves
   the ring untouched.
+- `WriteError` / `WriteResult` are the error every writer built on the ring
+  returns, so callers handle them the same way whichever library wrote:
+  `is_would_block()` means drain and repeat the call; `kind()` of
+  `InvalidInput` means it can never succeed.
 - `truncate(len)` takes back everything written since the length was `len`, to
   undo a sequence of writes that turned out not to fit as a whole.
 - `overwrite(offset, bytes)` fills in bytes already written, in place, to
   back-patch what could not be known at the time: a length prefix, a frame
   header.
-- `copy_within(src, dest)` moves bytes already written to another offset, like
-  `slice::copy_within` (ranges may overlap, and may wrap). It opens a gap in
-  what has been written when a length prefix turns out to need more room than
-  was reserved for it: extend the ring by the difference, move the content on,
-  then `overwrite` the prefix.
 
 ```rust
 let start = ring.len();
